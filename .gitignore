@@ -1,0 +1,7 @@
+aime/
+gsm/
+lcb/
+math/
+venv/
+__pycache__/
+*.json
