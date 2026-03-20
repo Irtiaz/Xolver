@@ -85,8 +85,8 @@ Also here is the leading responses with execution results from the response stor
 {response_store}
 
 Think carefully about where you went wrong, relating with responses in the response store. Then, try to
-fix the solution producing a thought first then reply with a C++ solution to be executed and judged again.
-Make sure to wrap your code in "```cpp```" block, and include exactly one
+fix the solution producing a thought first then reply with a {language} solution to be executed and judged again.
+Make sure to wrap your code in "```{code_block}```" block, and include exactly one
 block of code with the entire solution (in the final code step).
 """
 
@@ -115,7 +115,7 @@ You are an answer extractor. Your task is to extract answer from the response to
 problem. Here is the response for which the answer you have to extract:
 {response}
 
-Please extract the answer only inside from the "```cpp```" block from the response.
+Please extract the answer only inside from the "```{code_block}```" block from the response.
 """
 
 _DYNAMIC_AGENT_PROMPT_GENERAL = """
@@ -233,6 +233,7 @@ class Xolver:
         base_url: str = "http://localhost:11434/v1",
         api_key: str = "ollama",
         task_type: str = "coding",
+        language: str = "cpp",
         agents: int = 2,
         rounds: int = 2,
         retrieval_k: int = 5,
@@ -247,6 +248,7 @@ class Xolver:
             base_url:             Ollama API base URL. Default: "http://localhost:11434/v1".
             api_key:              API key placeholder (Ollama doesn't validate this). Default: "ollama".
             task_type:            "coding", "math", or "general". Controls prompts, judging, and answer extraction. Default: "coding".
+            language:             For coding tasks only. "cpp" or "python". Controls the code block tag and execution engine. Default: "cpp".
             agents:               Number of dynamic reasoning agents (m in the paper). Default: 2.
             rounds:               Number of iterative refinement rounds (I in the paper). Default: 2.
             retrieval_k:          Number of episodic memory examples to retrieve per query. Default: 5.
@@ -260,6 +262,7 @@ class Xolver:
         """
         self.model = model
         self.task_type = task_type
+        self.language = language
         self.agents = agents
         self.rounds = rounds
         self.retrieval_k = retrieval_k
@@ -311,10 +314,16 @@ class Xolver:
         return self._call([{"role": "user", "content": prompt}]).strip()
 
     def _extract_code(self, text: str) -> str:
-        match = re.search(r"```cpp(.*?)```", text, flags=re.S | re.I)
+        tag = re.escape(self.language)
+        match = re.search(rf"```{tag}(.*?)```", text, flags=re.S | re.I)
         return match.group(1).strip() if match else ""
 
     def _run_code_and_score(self, code: str, test_cases: list) -> tuple:
+        if self.language == "python":
+            return self._run_python_and_score(code, test_cases)
+        return self._run_cpp_and_score(code, test_cases)
+
+    def _run_cpp_and_score(self, code: str, test_cases: list) -> tuple:
         passed = 0
         reasoning = []
         for idx, case in enumerate(test_cases):
@@ -356,6 +365,38 @@ class Xolver:
                         os.unlink(path)
         return passed, "\n".join(reasoning)
 
+    def _run_python_and_score(self, code: str, test_cases: list) -> tuple:
+        passed = 0
+        reasoning = []
+        for idx, case in enumerate(test_cases):
+            input_data = case.get("input", "")
+            expected = case.get("output", "").strip()
+            src_path = ""
+            try:
+                with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+                    f.write(code)
+                    src_path = f.name
+                run_proc = subprocess.run(
+                    ["python3", src_path], input=input_data,
+                    capture_output=True, text=True, timeout=10,
+                )
+                os.unlink(src_path)
+                src_path = ""
+                if run_proc.returncode != 0:
+                    reasoning.append(f"Test {idx + 1}: Runtime error — {run_proc.stderr.strip()}")
+                    continue
+                actual = run_proc.stdout.strip()
+                if actual == expected:
+                    passed += 1
+                    reasoning.append(f"Test {idx + 1}: Passed")
+                else:
+                    reasoning.append(f"Test {idx + 1}: Failed — expected {expected!r}, got {actual!r}")
+            except Exception as e:
+                reasoning.append(f"Test {idx + 1}: Exception — {e}")
+                if src_path and os.path.exists(src_path):
+                    os.unlink(src_path)
+        return passed, "\n".join(reasoning)
+
     def _judge(self, problem: str, response: str, test_cases: Optional[list]) -> int:
         if self.task_type == "coding" and test_cases:
             code = self._extract_code(response)
@@ -372,7 +413,7 @@ class Xolver:
         if self.task_type == "general":
             return response
         if self.task_type == "coding":
-            prompt = _VERIFIER_PROMPT_CODING.format(task_type=self.task_type, response=response)
+            prompt = _VERIFIER_PROMPT_CODING.format(task_type=self.task_type, response=response, code_block=self.language)
         else:
             prompt = _VERIFIER_PROMPT_MATH.format(task_type=self.task_type, response=response)
         return self._call([{"role": "user", "content": prompt}])
@@ -398,6 +439,7 @@ class Xolver:
                 response_store=response_store,
             )
         if self.task_type == "coding":
+            lang_label = "Python" if self.language == "python" else "C++"
             return _DYNAMIC_AGENT_PROMPT_CODING.format(
                 role=role,
                 task_type=self.task_type,
@@ -407,6 +449,8 @@ class Xolver:
                 self_retrieval=self_text,
                 prev_response=prev_response or "None",
                 response_store=response_store,
+                language=lang_label,
+                code_block=self.language,
             )
         return _DYNAMIC_AGENT_PROMPT_MATH.format(
             role=role,
